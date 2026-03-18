@@ -2,25 +2,49 @@ import os
 import sys
 import json
 import argparse
+import urllib.request
+import urllib.error
 from openai import OpenAI
 
 # Maximum number of tool calls allowed per question
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 20
 
 
 def load_env():
-    """Load configuration from .env.agent.secret file."""
+    """Load configuration from .env.agent.secret and .env.docker.secret files."""
     config = {}
-    with open(".env.agent.secret", "r") as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                config[key.strip()] = value.strip()
+    
+    # Load LLM config from .env.agent.secret
+    agent_env_path = ".env.agent.secret"
+    if os.path.exists(agent_env_path):
+        with open(agent_env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    
+    # Load backend config from .env.docker.secret
+    docker_env_path = ".env.docker.secret"
+    if os.path.exists(docker_env_path):
+        with open(docker_env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    
+    # Also check environment variables (for autochecker injection)
+    for key in ["LLM_API_KEY", "LLM_API_BASE", "LLM_MODEL", "LMS_API_KEY", "AGENT_API_BASE_URL"]:
+        if os.environ.get(key) and key not in config:
+            config[key] = os.environ.get(key)
+    
     return {
         "api_key": config.get("LLM_API_KEY"),
         "api_base": config.get("LLM_API_BASE"),
         "model": config.get("LLM_MODEL"),
+        "lms_api_key": config.get("LMS_API_KEY"),
+        "agent_api_base_url": config.get("AGENT_API_BASE_URL", "http://localhost:42002"),
     }
 
 
@@ -78,29 +102,116 @@ def read_file(path: str) -> str:
 def list_files(path: str) -> str:
     """
     List files and directories at a given path.
-    
+
     Args:
         path: Relative directory path from project root
-        
+
     Returns:
         Newline-separated listing of entries, or error message
     """
     is_safe, result = is_safe_path(path)
     if not is_safe:
         return result
-    
+
     full_path = result
-    
+
     try:
         if not os.path.exists(full_path):
             return f"Error: Directory not found: {path}"
         if not os.path.isdir(full_path):
             return f"Error: Not a directory: {path}"
-        
+
         entries = os.listdir(full_path)
         return "\n".join(sorted(entries))
     except Exception as e:
         return f"Error listing directory: {e}"
+
+
+def query_api(method: str, path: str, body: str = None, auth: bool = True, config: dict = None) -> str:
+    """
+    Query the backend API with optional authentication.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API endpoint path (e.g., /items/, /analytics/completion-rate)
+        body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include authentication header (default: True)
+        config: Configuration dictionary with lms_api_key and agent_api_base_url
+
+    Returns:
+        JSON string with status_code and body
+    """
+    if config is None:
+        config = load_env()
+
+    api_key = config.get("lms_api_key")
+    base_url = config.get("agent_api_base_url", "http://localhost:42002")
+
+    # Build the full URL
+    url = f"{base_url}{path}"
+
+    # Prepare headers
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    # Add authentication header using Bearer token only if auth is True
+    if auth and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Prepare request data
+    data = None
+    if body:
+        data = body.encode("utf-8")
+
+    # Create and send request
+    try:
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            status_code = response.status
+            response_body = response.read().decode("utf-8")
+
+            # Try to parse as JSON
+            try:
+                body_json = json.loads(response_body)
+                return json.dumps({
+                    "status_code": status_code,
+                    "body": body_json
+                })
+            except json.JSONDecodeError:
+                return json.dumps({
+                    "status_code": status_code,
+                    "body": response_body
+                })
+
+    except urllib.error.HTTPError as e:
+        # HTTP error (4xx, 5xx)
+        error_body = e.read().decode("utf-8") if e.fp else ""
+        try:
+            body_json = json.loads(error_body)
+            return json.dumps({
+                "status_code": e.code,
+                "body": body_json
+            })
+        except json.JSONDecodeError:
+            return json.dumps({
+                "status_code": e.code,
+                "body": error_body
+            })
+
+    except urllib.error.URLError as e:
+        # Connection error
+        return json.dumps({
+            "status_code": 0,
+            "body": f"Connection error: {e.reason}"
+        })
+
+    except Exception as e:
+        return json.dumps({
+            "status_code": 0,
+            "body": f"Error: {str(e)}"
+        })
 
 
 # Tool definitions for the LLM function calling
@@ -138,13 +249,43 @@ TOOLS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Query the backend API to get live data such as item counts, analytics, or status codes. Use this for questions about the running system. Set auth=false to test unauthenticated requests.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE, etc.)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., /items/, /analytics/completion-rate)"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "JSON request body for POST/PUT requests (optional)"
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default: true). Set to false to test unauthenticated requests."
+                    }
+                },
+                "required": ["method", "path"]
+            }
+        }
     }
 ]
 
 # Map tool names to actual functions
 TOOL_FUNCTIONS = {
     "read_file": read_file,
-    "list_files": list_files
+    "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -164,6 +305,10 @@ def execute_tool(name: str, arguments: dict) -> str:
     
     try:
         func = TOOL_FUNCTIONS[name]
+        # For query_api, we need to pass config as well
+        if name == "query_api":
+            config = load_env()
+            return func(**arguments, config=config)
         return func(**arguments)
     except Exception as e:
         return f"Error executing tool: {e}"
@@ -181,13 +326,16 @@ def extract_source_from_answer(answer: str, messages: list) -> str:
         messages: The conversation history
         
     Returns:
-        Source reference string (e.g., "wiki/git-workflow.md#section")
+        Source reference string (e.g., "wiki/git-workflow.md#section" or "backend/app/routers/analytics.py")
     """
-    # Look for wiki file paths in the answer or messages
+    # Look for file paths in the answer or messages
     import re
     
     # Pattern to match wiki file paths
     wiki_pattern = r'wiki/[\w-]+\.md'
+    
+    # Pattern to match Python source files
+    python_pattern = r'backend/app/[\w_/]+\.py'
     
     # First check the answer itself
     match = re.search(wiki_pattern, answer)
@@ -201,11 +349,19 @@ def extract_source_from_answer(answer: str, messages: list) -> str:
             return f"{file_path}#{anchor_match.group(2)}"
         return file_path
     
+    # Check for Python source files
+    match = re.search(python_pattern, answer)
+    if match:
+        return match.group()
+    
     # Check the tool call results for file paths
     for msg in messages:
         if msg.get("role") == "tool":
             content = msg.get("content", "")
             match = re.search(wiki_pattern, content)
+            if match:
+                return match.group()
+            match = re.search(python_pattern, content)
             if match:
                 return match.group()
     
@@ -254,16 +410,18 @@ def run_agentic_loop(question: str, config: dict) -> dict:
         Dictionary with answer, source, and tool_calls
     """
     # System prompt instructs the LLM how to use tools
-    system_prompt = """You are a helpful documentation assistant. You have access to tools that can read files and list directories in a project repository.
+    system_prompt = """You are a helpful documentation assistant. You have access to tools that can read files, list directories, and query the backend API.
 
 When answering questions:
 1. Use list_files to discover what files exist in relevant directories
-2. Use read_file to read the contents of specific files
-3. Find the answer in the file contents
-4. Include a source reference with the file path and section anchor (e.g., wiki/git-workflow.md#resolving-merge-conflicts)
-5. Call tools one at a time, waiting for results before making the next call
+2. Use read_file to read the contents of specific files (source code, documentation, config files)
+3. Use query_api to get live data from the running backend (item counts, analytics, status codes)
+4. For questions about the running system (e.g., "how many items", "what status code"), use query_api
+5. For questions about source code or documentation, use read_file or list_files
+6. Include a source reference with the file path and section anchor when reading files
+7. Call tools one at a time, waiting for results before making the next call
 
-Always provide your final answer with the source field containing the wiki file path and section."""
+Always provide your final answer with the source field containing the wiki file path and section when applicable."""
 
     # Initialize messages with system prompt and user question
     messages = [

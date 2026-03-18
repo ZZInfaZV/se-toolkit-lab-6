@@ -43,7 +43,7 @@ class TestAgentOutput:
         assert result.returncode == 0, f"Agent failed with: {result.stderr}"
 
         output = json.loads(result.stdout)
-        
+
 
         # Check required fields exist
         assert "answer" in output, "Missing 'answer' field in output"
@@ -113,3 +113,48 @@ class TestAgentOutput:
 
         # Should have a non-empty answer
         assert output["answer"], "Answer should not be empty"
+
+    @pytest.mark.asyncio
+    async def test_agent_uses_query_api_for_item_count(self):
+        """Test that agent uses query_api tool when asked about database item count."""
+        result = subprocess.run(
+            [sys.executable, "agent.py", "How many items are in the database?"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, f"Agent failed with: {result.stderr}"
+
+        output = json.loads(result.stdout)
+
+        # Should have used query_api tool
+        tool_names = [tc["tool"] for tc in output["tool_calls"]]
+        assert "query_api" in tool_names, "Agent should use query_api tool for data queries"
+
+        # Answer should contain a number
+        import re
+        numbers = re.findall(r'\d+', output["answer"])
+        assert len(numbers) > 0, "Answer should contain a number"
+
+    @pytest.mark.asyncio
+    async def test_agent_uses_query_api_for_status_code(self):
+        """Test that agent uses query_api tool when asked about HTTP status codes."""
+        result = subprocess.run(
+            [sys.executable, "agent.py", "What HTTP status code does the API return when you request /items/ without authentication?"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, f"Agent failed with: {result.stderr}"
+
+        output = json.loads(result.stdout)
+
+        # Should have used query_api tool
+        tool_names = [tc["tool"] for tc in output["tool_calls"]]
+        assert "query_api" in tool_names, "Agent should use query_api tool for status code questions"
+
+        # Answer should contain 401 or 403 (unauthorized/forbidden)
+        assert "401" in output["answer"] or "403" in output["answer"], \
+            f"Answer should contain 401 or 403, got: {output['answer']}"
